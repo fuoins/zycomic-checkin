@@ -32,7 +32,7 @@
 
 - **补签不靠猜** — 禁漫从当月日历里读 `record[].date`，只补状态为漏签的日期，签完再拉一次日历复核。
 - **线路自动探测** — 内置线路优先，成功的线路写进 `picacg_host.txt` / `manwa_host.txt`，下次 1~3 秒就能定线路；远程配置只在内置全挂时兜底。
-- **IP 直连网络层** — 哔咔支持「DNS 解析 IP + SNI 保持域名」直连：内置 Cloudflare anycast IP 表 + SmartDNS 干净 IP 池，启动时并发竞速（域名直连 vs IP 直连）自动选路，慢 IP 自动轮换，被 DNS 污染时不再逐个请求干等 25 秒。
+- **IP 直连网络层** — 哔咔固定走「DNS 解析 IP + SNI 保持域名」直连：候选顺序为上次成功的最优 IP（缓存）→ SmartDNS 干净 IP 池 → 内置 Cloudflare anycast，慢 IP 超时自动轮换，不再做竞速判定，也不会被 DNS 污染拖到逐个请求干等几十秒。
 - **状态不误报** — 漫蛙 `signedtoday` / `signednot` / 空占位全部识别，再用积分明细交叉验证，不会把「未签」写成「已签」，也不会把「N 天未签到」的扣分记录当成签到成功。
 - **验证码有解** — `login` 会在本地起一个小页面，给出验证码图片直链，手机上看图输码即可，不用装抓包 App。
 
@@ -99,8 +99,8 @@ python3 zycomic_checkin.py login --no-web             # 无终端：存图 + 两
 | `PICACG_USER` / `PICACG_PASS` | 是 | 用户名 + 密码（接口字段叫 email，填用户名即可） |
 | `PICACG_API_HOST` | 否 | 自定义线路，逗号分隔 |
 | `PICACG_APP_UUID` | 否 | 固定设备 UUID，不填每次随机 |
-| `PICACG_ROUTE` | 否 | 网络路由：`auto` 竞速自动选（默认）/ `ip` 强制 IP 直连 / `domain` 强制域名直连 |
-| `PICACG_ROUTE_TTL` | 否 | 路由结论缓存秒数（默认 86400 = 1 天） |
+| `PICACG_ROUTE` | 否 | 默认 `ip` 固定 IP 直连；`domain` 手动退回域名直连（走系统 DNS，适合代理环境） |
+| `PICACG_ROUTE_TTL` | 否 | 最优 IP 缓存秒数（默认 86400 = 1 天） |
 | `PICACG_DNS_TTL` | 否 | SmartDNS IP 池缓存秒数（默认 604800 = 7 天） |
 
 ### 漫蛙
@@ -175,11 +175,11 @@ python3 zycomic_checkin.py login --no-web             # 无终端：存图 + 两
 <details>
 <summary><b>哔咔每次请求都超时重试，整轮跑 5 分钟</b></summary>
 
-这是本地 DNS 解析到劣质/污染 IP 的典型表现。v1.1.0 起默认 `PICACG_ROUTE=auto`：启动时并发竞速「域名直连 vs IP 直连」，自动选快的那条路（IP 直连时 TLS 的 SNI 与证书校验仍按域名，服务端视角不变），结果缓存 1 天；请求超时自动轮换下一个候选 IP，不再对同一个慢 IP 干等。
+这是本地 DNS 解析到劣质/污染 IP 的典型表现。v1.2.0 起哔咔**固定 IP 直连**：请求不再走本地 DNS，TCP 直接连候选 IP（TLS 的 SNI 与证书校验仍按域名，服务端视角不变）。候选顺序：上次成功的最优 IP（缓存 1 天）→ SmartDNS 干净 IP 池 → 内置 anycast 兜底；单个 IP 超时（5 秒）自动轮换下一个，成功后沿用并回写缓存，下次启动直接复用。
 
-- 有代理：直接给任务配 `HTTPS_PROXY=http://127.0.0.1:7890`（脚本检测到会自动走域名模式，由代理出口解析）。
-- 想手动指定：`PICACG_ROUTE=ip` 强制 IP 直连，`PICACG_ROUTE=domain` 强制域名直连。
-- 两条路都不通（SNI 级干扰）：20 秒内就会明确报错，挂代理是唯一解。
+- 有代理 / 需要走域名解析：设 `PICACG_ROUTE=domain`（配合任务里的 `HTTPS_PROXY` 使用）。
+- SmartDNS 缓存文件 `picacg_dns.txt`、最优 IP 缓存 `picacg_route.txt` 均自动生成，删掉即可强制刷新。
+- 全部候选 IP 都不通（SNI 级干扰）：会明确报错，挂代理是唯一解。
 </details>
 
 <details>

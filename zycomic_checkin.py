@@ -23,8 +23,6 @@ cron 建议：10 0 * * *
 
 import argparse
 import base64
-import concurrent.futures
-import functools
 import hashlib
 import hmac
 import html
@@ -344,13 +342,16 @@ def write_cached_host(path, host):
 # 网络路由层：DNS 解析 IP 直连 + SNI 保持域名
 # 移植自 ZYComic App 的 PicacgBuiltinNetwork / PicacgSmartDns / PicacgRouteManager：
 # IP 直连时 URL、Host、TLS SNI、证书校验全部保持域名不变，只把 TCP 对端换成干净的
-# Cloudflare anycast IP，绕开本地 DNS 污染 / 劣质解析。域名模式行为与旧版完全一致。
+# Cloudflare IP，绕开本地 DNS 污染 / 劣质解析。
+# 哔咔固定走 IP 直连，不再做代理检测 / 域名竞速（竞速里的域名探测一旦本地 DNS 卡住，
+# 会白等几十秒）。候选 IP 顺序：上次成功的最优 IP（缓存）→ SmartDNS 干净 IP 池 →
+# 内置 anycast 兜底；当前 IP 超时才轮换下一个，成功后继续沿用并回写缓存。
 # ---------------------------------------------------------------------------
 
-PICACG_TIMEOUT = 8  # 哔咔请求超时（秒），不再用全局 TIMEOUT=25 慢等
+PICACG_TIMEOUT = 5  # 哔咔请求超时（秒），不再用全局 TIMEOUT=25 慢等
 PICACG_ROUTE_FILE = os.path.join(SCRIPT_DIR, "picacg_route.txt")
 PICACG_DNS_FILE = os.path.join(SCRIPT_DIR, "picacg_dns.txt")
-PICACG_ROUTE_TTL = int(env("PICACG_ROUTE_TTL") or 86400)  # 路由结论缓存 1 天
+PICACG_ROUTE_TTL = int(env("PICACG_ROUTE_TTL") or 86400)  # 最优 IP 缓存 1 天
 PICACG_DNS_TTL = int(env("PICACG_DNS_TTL") or 7 * 86400)  # SmartDNS 池缓存 7 天
 
 # 内置根域名 → Cloudflare anycast IP（与 App PicacgBuiltinNetwork.rootRules 一致）
@@ -494,7 +495,7 @@ def write_route_cache(mode, ip):
 
 
 def picacg_ip_pool(hostname):
-    """hostname 的候选 IP：内置 anycast 按根域名匹配 → SmartDNS 追加 → 缓存最优置顶。"""
+    """hostname 的候选 IP：内置 anycast 按根域名匹配 → SmartDNS 追加 → 缓存最优 IP 无条件置顶。"""
     host = hostname.lower().rstrip(".")
     pool = []
     for root, ips in PICACG_BUILTIN_ROOTS.items():
@@ -507,113 +508,55 @@ def picacg_ip_pool(hostname):
             seen.add(ip)
             ordered.append(ip)
     cached_mode, cached_ip = read_route_cache()
-    if cached_mode == "ip" and cached_ip in ordered:
+    if cached_mode == "ip" and cached_ip:
+        # 上次请求成功的 IP 置顶：即使它已不在 SmartDNS 最新池里，也值得再试一次
         ordered = [cached_ip] + [i for i in ordered if i != cached_ip]
     return ordered
 
 
-# 路由全局状态：mode=ip/domain；ip 模式维护当前线路的候选池与游标
-ROUTE = {"mode": "domain", "hostname": "", "pool": [], "idx": -1, "ip": ""}
+# 路由全局状态：mode=ip/domain；ip 模式维护当前线路的候选池与游标（成功沿用，异常轮换）
+ROUTE = {"mode": "ip", "hostname": "", "pool": [], "idx": -1, "ip": ""}
 
 
 def picacg_bind_ip(host):
-    """IP 模式：把当前线路绑定到下一个候选 IP 并生效；池耗尽返回 False。"""
+    """IP 模式：确保当前线路已绑定候选 IP（首次调用绑定池中第一个，之后沿用当前 IP）。"""
     hostname = (urlparse(host).hostname or host).lower().rstrip(".")
     if ROUTE["hostname"] != hostname or not ROUTE["pool"]:
         ROUTE["hostname"] = hostname
         ROUTE["pool"] = picacg_ip_pool(hostname)
         ROUTE["idx"] = -1
-    if ROUTE["idx"] + 1 >= len(ROUTE["pool"]):
+    if ROUTE["idx"] >= 0:
+        return True  # 已绑定且未报错，沿用当前 IP，不无谓轮换
+    if not ROUTE["pool"]:
         return False
-    ROUTE["idx"] += 1
-    ROUTE["ip"] = ROUTE["pool"][ROUTE["idx"]]
+    ROUTE["idx"] = 0
+    ROUTE["ip"] = ROUTE["pool"][0]
     FORCED_IPS[hostname] = ROUTE["ip"]
     install_dns_patch()
     return True
 
 
-def picacg_race(host):
-    """并发竞速：域名直连 vs 多个 IP 直连（各线程独立连接，互不干扰）。返回 (mode, best_ip)。"""
-    hostname = (urlparse(host).hostname or host).lower().rstrip(".")
-    path = "/comics?page=1"
-    headers = picacg_headers(path, "GET", None)
-    ips = picacg_ip_pool(hostname)[:5]
-
-    def probe_domain():
-        start = time.time()
-        try:
-            resp = requests.request("GET", host.rstrip("/") + path, headers=headers, timeout=4)
-            return "domain", "", resp.status_code < 500, time.time() - start  # 400 也是业务响应，链路算通
-        except Exception:  # noqa: BLE001
-            return "domain", "", False, 4.0
-
-    def probe_ip(ip):
-        start = time.time()
-        try:
-            conn = PinnedConn(hostname, ip, timeout=4)
-            conn.request("GET", path, headers=headers)
-            resp = conn.getresponse()
-            resp.read(2048)
-            conn.close()
-            return "ip", ip, resp.status < 500, time.time() - start
-        except Exception:  # noqa: BLE001
-            return "ip", ip, False, 4.0
-
-    jobs = [probe_domain] + [functools.partial(probe_ip, ip) for ip in ips]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(jobs))) as pool:
-        results = list(pool.map(lambda job: job(), jobs))
-
-    domain_ok, domain_elapsed = False, 4.0
-    best_ip, ip_elapsed = "", 4.0
-    for kind, ip, ok, elapsed in results:
-        if kind == "domain" and ok:
-            domain_ok, domain_elapsed = True, elapsed
-        elif kind == "ip" and ok and elapsed < ip_elapsed:
-            best_ip, ip_elapsed = ip, elapsed
-    log(
-        "picacg",
-        "竞速结果：域名=" + ("通" if domain_ok else "不通")
-        + (f"（{domain_elapsed:.1f}s）" if domain_ok else "")
-        + (f"，IP {best_ip}（{ip_elapsed:.1f}s）" if best_ip else ""),
-    )
-    # 域名必须明显更快才值得信任：IP 直连绕开 DNS 污染，稳定性优先
-    if best_ip and (not domain_ok or ip_elapsed <= domain_elapsed + 1.0):
-        return "ip", best_ip
-    return "domain", ""
+def picacg_next_ip():
+    """IP 模式：当前 IP 请求异常时轮换到下一个候选；池耗尽返回 False。"""
+    if ROUTE["idx"] + 1 >= len(ROUTE["pool"]):
+        return False
+    ROUTE["idx"] += 1
+    ROUTE["ip"] = ROUTE["pool"][ROUTE["idx"]]
+    FORCED_IPS[ROUTE["hostname"]] = ROUTE["ip"]
+    return True
 
 
 def picacg_setup_route():
-    """三层路由判定（静态代理检测 → 缓存 → 竞速实测），返回 "ip" 或 "domain"。"""
-    requested = env("PICACG_ROUTE") or "auto"
-    if requested not in ("auto", "ip", "domain"):
-        requested = "auto"
-    # 第 1 层：代理环境变量存在时 requests 走代理，域名由代理出口解析，IP 直连无意义
-    if requested == "auto" and (env("HTTP_PROXY") or env("HTTPS_PROXY") or env("ALL_PROXY")):
-        log("picacg", "检测到代理环境变量（HTTP_PROXY/HTTPS_PROXY），由代理出口解析，路由=domain")
-        ROUTE["mode"] = "domain"
-        return "domain"
-    if requested in ("ip", "domain"):
-        ROUTE["mode"] = requested
-        log("picacg", f"路由={requested}（PICACG_ROUTE 显式指定）")
-        return requested
-    # 第 2 层：上次竞速结论仍在 TTL 内直接复用
-    cached_mode, cached_ip = read_route_cache()
-    if cached_mode:
-        ROUTE["mode"] = cached_mode
-        log(
-            "picacg",
-            f"路由={cached_mode}（上次竞速缓存，{PICACG_ROUTE_TTL // 3600}h 内有效）"
-            + (f"，最优 IP {cached_ip}" if cached_ip else ""),
-        )
-        return cached_mode
-    # 第 3 层：竞速实测（覆盖 TUN 模式 VPN / 透明代理等查不到环境变量的场景）
-    host = picacg_hosts()[0]
-    log("picacg", f"竞速探测：域名直连 vs IP 直连（{host}）…")
-    mode, best_ip = picacg_race(host)
-    write_route_cache(mode, best_ip)
-    ROUTE["mode"] = mode
-    log("picacg", f"路由={mode}" + (f"，最优 IP {best_ip}" if best_ip else "") + "（已缓存）")
-    return mode
+    """哔咔固定 IP 直连，不做代理检测 / 竞速判定；PICACG_ROUTE=domain 可手动退回域名模式。"""
+    requested = env("PICACG_ROUTE") or "ip"
+    if requested not in ("ip", "domain"):
+        requested = "ip"
+    ROUTE["mode"] = requested
+    if requested == "ip":
+        log("picacg", "路由=ip（IP 直连：缓存最优 → SmartDNS → 内置 anycast）")
+    else:
+        log("picacg", "路由=domain（PICACG_ROUTE 手动指定，走系统 DNS）")
+    return requested
 
 
 def picacg_nonce():
@@ -675,17 +618,22 @@ def picacg_request(method, path_and_query, body=None, token=None, retry=2, stric
             last_error = error
             if attempt < retry:
                 if ROUTE["mode"] == "ip" and ROUTE["pool"]:
-                    log("picacg", f"请求超时/异常（{ROUTE['ip']}），换下一个候选 IP 重试")
-                time.sleep(2 + attempt * 2)
+                    bad_ip = ROUTE["ip"]
+                    if not picacg_next_ip():
+                        raise RuntimeError(f"网络异常且 IP 池耗尽：{error}") from error
+                    log("picacg", f"请求超时/异常（{bad_ip}），换下一个候选 IP 重试")
+                time.sleep(1 + attempt)
                 continue
             raise RuntimeError(f"网络异常：{error}") from error
+        if ROUTE["mode"] == "ip" and ROUTE["ip"]:
+            write_route_cache("ip", ROUTE["ip"])  # 请求成功：记下最优 IP，下次直接置顶
 
         try:
             envelope = resp.json()
         except ValueError:
             last_error = f"响应不是 JSON（HTTP {resp.status_code}）"
             if attempt < retry:
-                time.sleep(2 + attempt * 2)
+                time.sleep(1 + attempt)
                 continue
             raise RuntimeError(last_error)
         if not strict:
@@ -737,7 +685,7 @@ def picacg_try(host):
     """单线路探测：成功返回 True。"""
     global PICACG_HOST
     PICACG_HOST = host
-    envelope = picacg_request("GET", "/comics?page=1", retry=0, strict=False, timeout=8)
+    envelope = picacg_request("GET", "/comics?page=1", retry=1, strict=False)
     if str(envelope.get("errorMsg") or "") == "Not legal.auth":
         raise RuntimeError("这是网页站，不是 API 线路")
     return True
@@ -781,7 +729,7 @@ def run_picacg():
         return "skip", "未配置 PICACG_USER / PICACG_PASS"
 
     PICACG_UUID = env("PICACG_APP_UUID") or uuid.uuid4().hex
-    picacg_setup_route()  # 路由判定：代理检测 → 缓存 → 竞速（域名直连 vs IP 直连）
+    picacg_setup_route()  # 固定 IP 直连（PICACG_ROUTE=domain 可手动退回域名模式）
     picacg_probe(picacg_hosts())
 
     try:

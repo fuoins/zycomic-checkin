@@ -23,15 +23,19 @@ cron 建议：10 0 * * *
 
 import argparse
 import base64
+import concurrent.futures
+import functools
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import os
 import queue
 import random
 import re
 import socket
+import ssl
 import string
 import sys
 import threading
@@ -336,6 +340,282 @@ def write_cached_host(path, host):
         pass
 
 
+# ---------------------------------------------------------------------------
+# 网络路由层：DNS 解析 IP 直连 + SNI 保持域名
+# 移植自 ZYComic App 的 PicacgBuiltinNetwork / PicacgSmartDns / PicacgRouteManager：
+# IP 直连时 URL、Host、TLS SNI、证书校验全部保持域名不变，只把 TCP 对端换成干净的
+# Cloudflare anycast IP，绕开本地 DNS 污染 / 劣质解析。域名模式行为与旧版完全一致。
+# ---------------------------------------------------------------------------
+
+PICACG_TIMEOUT = 8  # 哔咔请求超时（秒），不再用全局 TIMEOUT=25 慢等
+PICACG_ROUTE_FILE = os.path.join(SCRIPT_DIR, "picacg_route.txt")
+PICACG_DNS_FILE = os.path.join(SCRIPT_DIR, "picacg_dns.txt")
+PICACG_ROUTE_TTL = int(env("PICACG_ROUTE_TTL") or 86400)  # 路由结论缓存 1 天
+PICACG_DNS_TTL = int(env("PICACG_DNS_TTL") or 7 * 86400)  # SmartDNS 池缓存 7 天
+
+# 内置根域名 → Cloudflare anycast IP（与 App PicacgBuiltinNetwork.rootRules 一致）
+PICACG_BUILTIN_ROOTS = {
+    "go2778.com": ["104.21.42.75", "172.67.159.59"],
+    "picacomic.com": ["104.20.42.9", "172.66.173.71"],
+    "safedataplj.com": ["104.21.75.42", "172.67.213.2"],
+}
+PICACG_SMARTDNS_URLS = [
+    "https://macapi1.com/app/picacomic/dns/resolve?domain=picaapi.picacomic.com",
+    "https://macapi3.top/app/picacomic/dns/resolve?domain=picaapi.picacomic.com",
+]
+
+# IP 直连模式的解析覆盖表（只含哔咔白名单域名；漫蛙走系统 DNS，不受影响）
+FORCED_IPS = {}
+_ORIG_GETADDRINFO = socket.getaddrinfo
+
+
+def _patched_getaddrinfo(host, *args, **kwargs):
+    if isinstance(host, str) and host in FORCED_IPS:
+        host = FORCED_IPS[host]
+    return _ORIG_GETADDRINFO(host, *args, **kwargs)
+
+
+def dns_patch_installed():
+    return socket.getaddrinfo is _patched_getaddrinfo
+
+
+def install_dns_patch():
+    if not dns_patch_installed():
+        socket.getaddrinfo = _patched_getaddrinfo
+
+
+class PinnedConn(http.client.HTTPSConnection):
+    """TCP 连到指定 ip，TLS 的 SNI 用 sni（None 表示空 SNI，证书校验随之关闭）。"""
+
+    def __init__(self, domain, ip, timeout=PICACG_TIMEOUT, sni=None):
+        super().__init__(domain, timeout=timeout)
+        self._ip = ip
+        self._sni = sni
+
+    def connect(self):
+        sock = socket.create_connection((self._ip, self.port), self.timeout)
+        if self._sni is None:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        else:
+            context = ssl.create_default_context()
+        self.sock = context.wrap_socket(sock, server_hostname=self._sni)
+
+
+def is_public_ipv4(text):
+    """严格 IPv4 字面量 + 公网段过滤（与 App isPublicIpv4 一致）。"""
+    parts = text.split(".")
+    if len(parts) != 4 or not all(
+        p.isdigit() and 0 <= int(p) <= 255 and (p == "0" or not p.startswith("0")) for p in parts
+    ):
+        return False
+    a, b, c, _ = (int(p) for p in parts)
+    if a == 0 or a == 10 or a == 127 or a >= 224:
+        return False
+    if a == 100 and 64 <= b <= 127:
+        return False  # 共享地址段
+    if a == 169 and b == 254:
+        return False
+    if a == 172 and 16 <= b <= 31:
+        return False
+    if a == 192 and b == 168:
+        return False
+    if a == 192 and b == 0 and c in (0, 2):
+        return False  # 协议分配 / 文档段
+    if a == 192 and b == 88 and c == 99:
+        return False  # 废弃 6to4 中继
+    if a == 198 and b in (18, 19, 51) and (b != 51 or c == 100):
+        return False  # 基准测试 / 文档段
+    if a == 203 and b == 0 and c == 113:
+        return False  # 文档段
+    return True
+
+
+def picacg_smartdns_ips():
+    """SmartDNS 干净 IP 池：TTL 内读缓存，过期拉接口；失败返回空列表（不致命）。"""
+    try:
+        with open(PICACG_DNS_FILE, encoding="utf-8") as handle:
+            obj = json.loads(handle.read())
+        if time.time() - float(obj.get("ts") or 0) < PICACG_DNS_TTL:
+            ips = [i for i in (obj.get("ips") or []) if is_public_ipv4(i)]
+            if ips:
+                return ips
+    except Exception:  # noqa: BLE001
+        pass
+    ips = []
+    for url in PICACG_SMARTDNS_URLS:
+        try:
+            resp = requests.get(url, timeout=5, headers={"User-Agent": PICACG_UA, "Accept": "application/json"})
+            root = resp.json() if resp.status_code == 200 else {}
+            if root.get("code") != 200:
+                continue
+            lines = (root.get("data") or {}).get("lines") or {}
+            polluted = set()
+            for line in lines.values():
+                polluted.update(line.get("pollutedIps") or [])
+            for line in lines.values():
+                if str(line.get("status", "")).lower() != "ok":
+                    continue
+                for ip in line.get("ips") or []:
+                    if is_public_ipv4(ip) and ip not in polluted:
+                        ips.append(ip)
+            if ips:
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if ips:
+        try:
+            with open(PICACG_DNS_FILE, "w", encoding="utf-8") as handle:
+                json.dump({"ts": int(time.time()), "ips": ips[:64]}, handle)
+        except Exception:  # noqa: BLE001
+            pass
+    return ips
+
+
+def read_route_cache():
+    """上次路由结论 (mode, best_ip)；无或过期返回 (None, None)。"""
+    try:
+        with open(PICACG_ROUTE_FILE, encoding="utf-8") as handle:
+            parts = handle.read().strip().split("|")
+        if len(parts) >= 3 and time.time() - float(parts[2]) < PICACG_ROUTE_TTL and parts[0] in ("ip", "domain"):
+            return parts[0], parts[1]
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def write_route_cache(mode, ip):
+    try:
+        with open(PICACG_ROUTE_FILE, "w", encoding="utf-8") as handle:
+            handle.write(f"{mode}|{ip}|{int(time.time())}\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def picacg_ip_pool(hostname):
+    """hostname 的候选 IP：内置 anycast 按根域名匹配 → SmartDNS 追加 → 缓存最优置顶。"""
+    host = hostname.lower().rstrip(".")
+    pool = []
+    for root, ips in PICACG_BUILTIN_ROOTS.items():
+        if host == root or host.endswith("." + root):
+            pool.extend(ips)
+    pool.extend(picacg_smartdns_ips())
+    ordered, seen = [], set()
+    for ip in pool:
+        if ip not in seen:
+            seen.add(ip)
+            ordered.append(ip)
+    cached_mode, cached_ip = read_route_cache()
+    if cached_mode == "ip" and cached_ip in ordered:
+        ordered = [cached_ip] + [i for i in ordered if i != cached_ip]
+    return ordered
+
+
+# 路由全局状态：mode=ip/domain；ip 模式维护当前线路的候选池与游标
+ROUTE = {"mode": "domain", "hostname": "", "pool": [], "idx": -1, "ip": ""}
+
+
+def picacg_bind_ip(host):
+    """IP 模式：把当前线路绑定到下一个候选 IP 并生效；池耗尽返回 False。"""
+    hostname = (urlparse(host).hostname or host).lower().rstrip(".")
+    if ROUTE["hostname"] != hostname or not ROUTE["pool"]:
+        ROUTE["hostname"] = hostname
+        ROUTE["pool"] = picacg_ip_pool(hostname)
+        ROUTE["idx"] = -1
+    if ROUTE["idx"] + 1 >= len(ROUTE["pool"]):
+        return False
+    ROUTE["idx"] += 1
+    ROUTE["ip"] = ROUTE["pool"][ROUTE["idx"]]
+    FORCED_IPS[hostname] = ROUTE["ip"]
+    install_dns_patch()
+    return True
+
+
+def picacg_race(host):
+    """并发竞速：域名直连 vs 多个 IP 直连（各线程独立连接，互不干扰）。返回 (mode, best_ip)。"""
+    hostname = (urlparse(host).hostname or host).lower().rstrip(".")
+    path = "/comics?page=1"
+    headers = picacg_headers(path, "GET", None)
+    ips = picacg_ip_pool(hostname)[:5]
+
+    def probe_domain():
+        start = time.time()
+        try:
+            resp = requests.request("GET", host.rstrip("/") + path, headers=headers, timeout=4)
+            return "domain", "", resp.status_code < 500, time.time() - start  # 400 也是业务响应，链路算通
+        except Exception:  # noqa: BLE001
+            return "domain", "", False, 4.0
+
+    def probe_ip(ip):
+        start = time.time()
+        try:
+            conn = PinnedConn(hostname, ip, timeout=4)
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            resp.read(2048)
+            conn.close()
+            return "ip", ip, resp.status < 500, time.time() - start
+        except Exception:  # noqa: BLE001
+            return "ip", ip, False, 4.0
+
+    jobs = [probe_domain] + [functools.partial(probe_ip, ip) for ip in ips]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(jobs))) as pool:
+        results = list(pool.map(lambda job: job(), jobs))
+
+    domain_ok, domain_elapsed = False, 4.0
+    best_ip, ip_elapsed = "", 4.0
+    for kind, ip, ok, elapsed in results:
+        if kind == "domain" and ok:
+            domain_ok, domain_elapsed = True, elapsed
+        elif kind == "ip" and ok and elapsed < ip_elapsed:
+            best_ip, ip_elapsed = ip, elapsed
+    log(
+        "picacg",
+        "竞速结果：域名=" + ("通" if domain_ok else "不通")
+        + (f"（{domain_elapsed:.1f}s）" if domain_ok else "")
+        + (f"，IP {best_ip}（{ip_elapsed:.1f}s）" if best_ip else ""),
+    )
+    # 域名必须明显更快才值得信任：IP 直连绕开 DNS 污染，稳定性优先
+    if best_ip and (not domain_ok or ip_elapsed <= domain_elapsed + 1.0):
+        return "ip", best_ip
+    return "domain", ""
+
+
+def picacg_setup_route():
+    """三层路由判定（静态代理检测 → 缓存 → 竞速实测），返回 "ip" 或 "domain"。"""
+    requested = env("PICACG_ROUTE") or "auto"
+    if requested not in ("auto", "ip", "domain"):
+        requested = "auto"
+    # 第 1 层：代理环境变量存在时 requests 走代理，域名由代理出口解析，IP 直连无意义
+    if requested == "auto" and (env("HTTP_PROXY") or env("HTTPS_PROXY") or env("ALL_PROXY")):
+        log("picacg", "检测到代理环境变量（HTTP_PROXY/HTTPS_PROXY），由代理出口解析，路由=domain")
+        ROUTE["mode"] = "domain"
+        return "domain"
+    if requested in ("ip", "domain"):
+        ROUTE["mode"] = requested
+        log("picacg", f"路由={requested}（PICACG_ROUTE 显式指定）")
+        return requested
+    # 第 2 层：上次竞速结论仍在 TTL 内直接复用
+    cached_mode, cached_ip = read_route_cache()
+    if cached_mode:
+        ROUTE["mode"] = cached_mode
+        log(
+            "picacg",
+            f"路由={cached_mode}（上次竞速缓存，{PICACG_ROUTE_TTL // 3600}h 内有效）"
+            + (f"，最优 IP {cached_ip}" if cached_ip else ""),
+        )
+        return cached_mode
+    # 第 3 层：竞速实测（覆盖 TUN 模式 VPN / 透明代理等查不到环境变量的场景）
+    host = picacg_hosts()[0]
+    log("picacg", f"竞速探测：域名直连 vs IP 直连（{host}）…")
+    mode, best_ip = picacg_race(host)
+    write_route_cache(mode, best_ip)
+    ROUTE["mode"] = mode
+    log("picacg", f"路由={mode}" + (f"，最优 IP {best_ip}" if best_ip else "") + "（已缓存）")
+    return mode
+
+
 def picacg_nonce():
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
 
@@ -372,15 +652,18 @@ class PicacgBusinessError(RuntimeError):
     """服务端明确的业务错误：重试没有意义，直接上抛。"""
 
 
-def picacg_request(method, path_and_query, body=None, token=None, retry=2, strict=True, timeout=TIMEOUT):
+def picacg_request(method, path_and_query, body=None, token=None, retry=2, strict=True, timeout=PICACG_TIMEOUT):
     """strict=False 时只要拿到合法 JSON 即返回，用于线路探测。
 
     哔咔的业务错误同样返回 HTTP 200 + code=200，真实错误在 errorMsg / error，
     data 为空数组（如 "Not legal.auth"），因此必须额外校验 data 形状。
     只有网络异常和响应不是 JSON 才重试，账号密码错这类业务错误一次就返回。
+    IP 直连模式下，网络异常重试会轮换到下一个候选 IP，而不是对同一个慢 IP 干等。
     """
     last_error = None
     for attempt in range(retry + 1):
+        if ROUTE["mode"] == "ip" and not picacg_bind_ip(PICACG_HOST):
+            raise RuntimeError(f"网络异常且 IP 池耗尽：{last_error}")
         url = PICACG_HOST.rstrip("/") + path_and_query
         headers = picacg_headers(path_and_query, method, token)
         kwargs = {"headers": headers, "timeout": timeout}
@@ -391,6 +674,8 @@ def picacg_request(method, path_and_query, body=None, token=None, retry=2, stric
         except Exception as error:  # noqa: BLE001
             last_error = error
             if attempt < retry:
+                if ROUTE["mode"] == "ip" and ROUTE["pool"]:
+                    log("picacg", f"请求超时/异常（{ROUTE['ip']}），换下一个候选 IP 重试")
                 time.sleep(2 + attempt * 2)
                 continue
             raise RuntimeError(f"网络异常：{error}") from error
@@ -496,6 +781,7 @@ def run_picacg():
         return "skip", "未配置 PICACG_USER / PICACG_PASS"
 
     PICACG_UUID = env("PICACG_APP_UUID") or uuid.uuid4().hex
+    picacg_setup_route()  # 路由判定：代理检测 → 缓存 → 竞速（域名直连 vs IP 直连）
     picacg_probe(picacg_hosts())
 
     try:
@@ -581,7 +867,59 @@ def manwa_decrypt(raw, ts):
     return plain.decode("utf-8", "replace")
 
 
+def manwa_parse_response(status, headers, raw_bytes, ts, allow_empty):
+    """漫蛙响应解析：二进制直通 / 空响应 / JSON / AES 解密，与请求方式无关。"""
+    content_type = headers.get("content-type", "")
+    if "image" in content_type or "octet-stream" in content_type:
+        return {"code": 1, "data": raw_bytes}
+    raw = raw_bytes.decode("utf-8", "replace").strip()
+    if not raw:
+        if allow_empty and status < 400:
+            # /ad_click 这类接口成功时就是空响应，不能当失败重试
+            return {"code": 1, "data": {}}
+        raise RuntimeError(f"空响应（HTTP {status}）")
+    try:
+        envelope = json.loads(raw)
+    except ValueError:
+        envelope = None
+    if envelope is None or isinstance(envelope, str):
+        envelope = json.loads(manwa_decrypt(raw, ts))
+    return envelope
+
+
+def manwa_sni_omit_applies(host):
+    """空 SNI 只作用于用户手动配置的线路（App ManwaSniPolicy：显式配置的主机）。"""
+    custom = split_hosts(env("MANWA_API_HOST"))
+    return bool(custom) and host.rstrip("/") in custom
+
+
+def manwa_request_sni_omit(host, method, path, json_body=None, retry=2, allow_empty=False, timeout=TIMEOUT):
+    """空 SNI 直连：TLS 不发 SNI 且跳过证书校验，仅用于被 SNI 干扰的自定义线路。"""
+    hostname = urlparse(host).hostname
+    last_error = None
+    for attempt in range(retry + 1):
+        url, headers, ts = manwa_build(host, path)
+        parsed = urlparse(url)
+        body = json.dumps(json_body, ensure_ascii=False).encode("utf-8") if json_body is not None else None
+        try:
+            ip = socket.getaddrinfo(hostname, 443)[0][4][0]  # 漫蛙走系统 DNS，不受 IP 映射影响
+            conn = PinnedConn(hostname, ip, timeout=timeout, sni=None)
+            path_and_query = parsed.path + (("?" + parsed.query) if parsed.query else "")
+            conn.request(method, path_and_query, body=body, headers=headers)
+            resp = conn.getresponse()
+            envelope = manwa_parse_response(resp.status, dict(resp.getheaders()), resp.read(), ts, allow_empty)
+            conn.close()
+            return envelope
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+        if attempt < retry:
+            time.sleep(2 + attempt * 2)
+    raise RuntimeError(f"{method} {path} 失败（空 SNI 直连）：{last_error}")
+
+
 def manwa_request(session, host, method, path, json_body=None, retry=2, allow_empty=False, timeout=TIMEOUT):
+    if env("MANWA_SNI_OMIT") == "1" and manwa_sni_omit_applies(host):
+        return manwa_request_sni_omit(host, method, path, json_body, retry, allow_empty, timeout)
     last_error = None
     for attempt in range(retry + 1):
         url, headers, ts = manwa_build(host, path)
@@ -590,23 +928,7 @@ def manwa_request(session, host, method, path, json_body=None, retry=2, allow_em
             kwargs["json"] = json_body
         try:
             resp = session.request(method, url, **kwargs)
-            content_type = resp.headers.get("content-type", "")
-            if "image" in content_type or "octet-stream" in content_type:
-                return {"code": 1, "data": resp.content}
-            raw = resp.text.strip()
-            if not raw:
-                if allow_empty and resp.status_code < 400:
-                    # /ad_click 这类接口成功时就是空响应，不能当失败重试
-                    return {"code": 1, "data": {}}
-                last_error = f"空响应（HTTP {resp.status_code}）"
-            else:
-                try:
-                    envelope = json.loads(raw)
-                except ValueError:
-                    envelope = None
-                if envelope is None or isinstance(envelope, str):
-                    envelope = json.loads(manwa_decrypt(raw, ts))
-                return envelope
+            return manwa_parse_response(resp.status_code, resp.headers, resp.content, ts, allow_empty)
         except Exception as error:  # noqa: BLE001
             last_error = error
         if attempt < retry:
